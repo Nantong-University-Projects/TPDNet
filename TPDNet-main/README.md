@@ -16,14 +16,3 @@ Consistency Constraints
 </div>
 
 
-
-
-<!--ts-->
-* [open-mmlab/mmdetection](https://github.com/open-mmlab/mmdetection)
-* [pytorch/vision](https://github.com/pytorch/vision)
-* [Turoad/lanedet](https://github.com/Turoad/lanedet)
-* [ZJULearning/resa](https://github.com/ZJULearning/resa)
-* [cfzd/Ultra-Fast-Lane-Detection](https://github.com/cfzd/Ultra-Fast-Lane-Detection)
-* [lucastabelini/LaneATT](https://github.com/lucastabelini/LaneATT)
-* [aliyun/conditional-lane-detection](https://github.com/aliyun/conditional-lane-detection)
-<!--te-->
