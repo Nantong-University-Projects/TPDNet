@@ -16,6 +16,7 @@ from clrnet.models.utils.roi_gather import ROIGather, LinearModule
 from clrnet.models.utils.seg_decoder import SegDecoder
 from clrnet.models.utils.dynamic_assign import assign
 from clrnet.models.losses.lineiou_loss import liou_loss
+from ..utils.topology_position_reasoner import TopologyPositionReasoner
 from ..registry import HEADS
 
 
@@ -30,9 +31,19 @@ class CLRHead(nn.Module):
                  refine_layers=3,
                  sample_points=36,
                  use_directional_attention=True,
+                 use_tpr=True,
+                 tpr_num_heads=4,
+                 tpr_dropout=0.1,
                  cfg=None):
         super(CLRHead, self).__init__()
         self.cfg = cfg
+        if self.cfg.haskey('use_tpr'):
+            use_tpr = self.cfg.use_tpr
+        if self.cfg.haskey('tpr_num_heads'):
+            tpr_num_heads = self.cfg.tpr_num_heads
+        if self.cfg.haskey('tpr_dropout'):
+            tpr_dropout = self.cfg.tpr_dropout
+
         self.img_w = self.cfg.img_w
         self.img_h = self.cfg.img_h
         self.n_strips = num_points - 1
@@ -77,6 +88,13 @@ class CLRHead(nn.Module):
                                     self.sample_points, self.fc_hidden_dim,
                                     self.refine_layers,
                                     use_directional_attention=use_directional_attention)
+        self.use_tpr = use_tpr
+        if self.use_tpr:
+            self.tpr = TopologyPositionReasoner(
+                feat_dim=self.fc_hidden_dim,
+                num_heads=tpr_num_heads,
+                dropout=tpr_dropout,
+                n_offsets=self.n_offsets)
 
         self.reg_layers = nn.Linear(
             self.fc_hidden_dim, self.n_offsets + 1 + 2 +
@@ -88,10 +106,8 @@ class CLRHead(nn.Module):
         self.criterion = torch.nn.NLLLoss(ignore_index=self.cfg.ignore_label,
                                      weight=weights)
 
-        # init the weights here
         self.init_weights()
 
-    # function to init layer weights
     def init_weights(self):
         # initialize heads
         for m in self.cls_layers.parameters():
@@ -202,6 +218,7 @@ class CLRHead(nn.Module):
                                                       batch_size, 1, 1)
 
         predictions_lists = []
+        tpr_attn_lists = []
 
         # iterative refine
         prior_features_stages = []
@@ -215,6 +232,10 @@ class CLRHead(nn.Module):
 
             fc_features = self.roi_gather(prior_features_stages,
                                           batch_features[stage], stage)
+
+            if self.use_tpr:
+                fc_features, tpr_attn = self.tpr(fc_features, priors)
+                tpr_attn_lists.append(tpr_attn)
 
             fc_features = fc_features.view(num_priors, batch_size,
                                            -1).reshape(batch_size * num_priors,
@@ -274,6 +295,8 @@ class CLRHead(nn.Module):
                                      dim=1)
             seg = self.seg_decoder(seg_features)
             output = {'predictions_lists': predictions_lists, 'seg': seg}
+            if self.use_tpr:
+                output['tpr_attn_lists'] = tpr_attn_lists
             return self.loss(output, kwargs['batch'])
 
         return predictions_lists[-1]
@@ -489,18 +512,13 @@ class CLRHead(nn.Module):
                     overlap=self.cfg.test_parameters.nms_thres,
                     top_k=self.cfg.max_lanes)
                 
-                # 立即清理中间变量
                 del nms_predictions
                 torch.cuda.empty_cache()
-                
-                # 使用numel()而不是len()，避免创建新的tensor
-                # 确保索引在有效范围内
+            
                 if num_to_keep > 0:
                     keep = keep[:num_to_keep]
-                    # 边界检查：确保所有索引都在有效范围内
                     max_idx = predictions.shape[0] - 1
                     if isinstance(keep, torch.Tensor):
-                        # 确保索引在[0, max_idx]范围内
                         valid_mask = (keep >= 0) & (keep <= max_idx)
                         if valid_mask.any():
                             keep = keep[valid_mask]
@@ -509,7 +527,6 @@ class CLRHead(nn.Module):
                             decoded.append([])
                             continue
                     else:
-                        # 如果是numpy数组或其他类型，转换为tensor
                         keep = torch.tensor(keep, device=predictions.device, dtype=torch.long)
                         valid_mask = (keep >= 0) & (keep <= max_idx)
                         if valid_mask.any():
@@ -532,14 +549,13 @@ class CLRHead(nn.Module):
                 else:
                     pred = predictions
                 decoded.append(pred)
-                
-                # 清理变量释放显存
+            
                 del predictions, scores, keep
                 torch.cuda.empty_cache()
                 
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    # 显存不足时，返回空结果并清理
+
                     torch.cuda.empty_cache()
                     decoded.append([])
                     continue
