@@ -70,7 +70,6 @@ class CLRHead(nn.Module):
         self.register_buffer(name='priors', tensor=init_priors)
         self.register_buffer(name='priors_on_featmap', tensor=priors_on_featmap)
 
-        # generate xys for feature map
         self.seg_decoder = SegDecoder(self.img_h, self.img_w,
                                       self.cfg.num_classes,
                                       self.prior_feat_channels,
@@ -106,6 +105,7 @@ class CLRHead(nn.Module):
         self.criterion = torch.nn.NLLLoss(ignore_index=self.cfg.ignore_label,
                                      weight=weights)
 
+        # init the weights here
         self.init_weights()
 
     def init_weights(self):
@@ -116,12 +116,48 @@ class CLRHead(nn.Module):
         for m in self.reg_layers.parameters():
             nn.init.normal_(m, mean=0., std=1e-3)
 
+    def _lane_smoothness_loss(self, lane_xs):
+        if lane_xs.numel() == 0 or lane_xs.shape[-1] < 3:
+            return lane_xs.new_tensor(0.)
+
+        valid = (lane_xs >= 0) & (lane_xs < self.img_w)
+        valid_triplets = valid[:, :-2] & valid[:, 1:-1] & valid[:, 2:]
+        if not valid_triplets.any():
+            return lane_xs.new_tensor(0.)
+
+        second_diff = lane_xs[:, 2:] - 2 * lane_xs[:, 1:-1] + lane_xs[:, :-2]
+        return second_diff[valid_triplets].pow(2).mean()
+
+    def _lane_order_loss(self, lane_xs, margin=5.):
+        if lane_xs.numel() == 0 or lane_xs.shape[0] < 2:
+            return lane_xs.new_tensor(0.)
+
+        valid = (lane_xs >= 0) & (lane_xs < self.img_w)
+        valid_counts = valid.sum(dim=1).clamp(min=1)
+        mean_x = (lane_xs * valid.float()).sum(dim=1) / valid_counts.float()
+        sorted_inds = torch.argsort(mean_x)
+        sorted_xs = lane_xs[sorted_inds]
+        sorted_valid = valid[sorted_inds]
+
+        left_xs = sorted_xs[:-1]
+        right_xs = sorted_xs[1:]
+        pair_valid = sorted_valid[:-1] & sorted_valid[1:]
+        if not pair_valid.any():
+            return lane_xs.new_tensor(0.)
+
+        separation = right_xs - left_xs
+        order_penalty = F.relu(margin - separation)
+        return order_penalty[pair_valid].mean()
+
+    def _orthogonality_loss(self, reg_features, cls_features):
+        if reg_features.numel() == 0 or cls_features.numel() == 0:
+            return reg_features.new_tensor(0.)
+
+        prod = torch.bmm(reg_features.transpose(1, 2), cls_features)
+        scale = max(reg_features.shape[1] * reg_features.shape[2], 1)
+        return prod.pow(2).mean() / scale
+
     def pool_prior_features(self, batch_features, num_priors, prior_xs):
-        '''
-        pool prior feature from feature map.
-        Args:
-            batch_features (Tensor): Input feature maps, shape: (B, C, H, W) 
-        '''
 
         batch_size = batch_features.shape[0]
 
@@ -197,15 +233,6 @@ class CLRHead(nn.Module):
 
     # forward function here
     def forward(self, x, **kwargs):
-        '''
-        Take pyramid features as input to perform Cross Layer Refinement and finally output the prediction lanes.
-        Each feature is a 4D tensor.
-        Args:
-            x: input features (list[Tensor])
-        Return:
-            prediction_list: each layer's prediction result
-            seg: segmentation result for auxiliary loss
-        '''
         batch_features = list(x[len(x) - self.refine_layers:])
         batch_features.reverse()
         batch_size = batch_features[-1].shape[0]
@@ -219,8 +246,8 @@ class CLRHead(nn.Module):
 
         predictions_lists = []
         tpr_attn_lists = []
+        final_stage_branch_features = {}
 
-        # iterative refine
         prior_features_stages = []
         for stage in range(self.refine_layers):
             num_priors = priors_on_featmap.shape[1]
@@ -247,6 +274,12 @@ class CLRHead(nn.Module):
                 cls_features = cls_layer(cls_features)
             for reg_layer in self.reg_modules:
                 reg_features = reg_layer(reg_features)
+
+            if stage == self.refine_layers - 1:
+                final_stage_branch_features = {
+                    'cls': cls_features.reshape(batch_size, num_priors, -1),
+                    'reg': reg_features.reshape(batch_size, num_priors, -1)
+                }
 
             cls_logits = self.cls_layers(cls_features)
             reg = self.reg_layers(reg_features)
@@ -297,14 +330,14 @@ class CLRHead(nn.Module):
             output = {'predictions_lists': predictions_lists, 'seg': seg}
             if self.use_tpr:
                 output['tpr_attn_lists'] = tpr_attn_lists
+            if final_stage_branch_features:
+                output['final_stage_branch_features'] = final_stage_branch_features
             return self.loss(output, kwargs['batch'])
 
         return predictions_lists[-1]
 
     def predictions_to_pred(self, predictions):
-        '''
-        Convert predictions to internal Lane structure for evaluation.
-        '''
+        
         self.prior_ys = self.prior_ys.to(predictions.device)
         self.prior_ys = self.prior_ys.double()
         lanes = []
@@ -349,7 +382,11 @@ class CLRHead(nn.Module):
              cls_loss_weight=2.,
              xyt_loss_weight=0.5,
              iou_loss_weight=2.,
-             seg_loss_weight=1.):
+             seg_loss_weight=1.,
+             tcl_loss_weight=0.1,
+             order_loss_weight=1.0,
+             orth_loss_weight=0.01,
+             order_margin=5.):
         if self.cfg.haskey('cls_loss_weight'):
             cls_loss_weight = self.cfg.cls_loss_weight
         if self.cfg.haskey('xyt_loss_weight'):
@@ -358,6 +395,14 @@ class CLRHead(nn.Module):
             iou_loss_weight = self.cfg.iou_loss_weight
         if self.cfg.haskey('seg_loss_weight'):
             seg_loss_weight = self.cfg.seg_loss_weight
+        if self.cfg.haskey('tcl_loss_weight'):
+            tcl_loss_weight = self.cfg.tcl_loss_weight
+        if self.cfg.haskey('order_loss_weight'):
+            order_loss_weight = self.cfg.order_loss_weight
+        if self.cfg.haskey('orth_loss_weight'):
+            orth_loss_weight = self.cfg.orth_loss_weight
+        if self.cfg.haskey('order_margin'):
+            order_margin = self.cfg.order_margin
 
         predictions_lists = output['predictions_lists']
         targets = batch['lane_line'].clone()
@@ -365,10 +410,12 @@ class CLRHead(nn.Module):
         cls_loss = 0
         reg_xytl_loss = 0
         iou_loss = 0
+        smooth_loss = 0
+        order_loss = 0
         cls_acc = []
 
-        cls_acc_stage = []
         for stage in range(self.refine_layers):
+            cls_acc_stage = []
             predictions_list = predictions_lists[stage]
             for predictions, target in zip(predictions_list, targets):
                 target = target[target[:, 1] == 1]
@@ -427,23 +474,39 @@ class CLRHead(nn.Module):
                 iou_loss = iou_loss + liou_loss(
                     reg_pred, reg_targets,
                     self.img_w, length=15)
+                smooth_loss = smooth_loss + self._lane_smoothness_loss(reg_pred)
+                order_loss = order_loss + self._lane_order_loss(
+                    reg_pred, margin=order_margin)
 
                 # calculate acc
                 cls_accuracy = accuracy(cls_pred, cls_target)
                 cls_acc_stage.append(cls_accuracy)
 
-            cls_acc.append(sum(cls_acc_stage) / len(cls_acc_stage))
+            if cls_acc_stage:
+                cls_acc.append(sum(cls_acc_stage) / len(cls_acc_stage))
+            else:
+                cls_acc.append(predictions_lists[stage].new_tensor(0.))
 
         # extra segmentation loss
         seg_loss = self.criterion(F.log_softmax(output['seg'], dim=1),
                              batch['seg'].long())
+        tcl_loss = smooth_loss + order_loss_weight * order_loss
+        orth_loss = predictions_lists[0].new_tensor(0.)
+        if 'final_stage_branch_features' in output:
+            orth_loss = self._orthogonality_loss(
+                output['final_stage_branch_features']['reg'],
+                output['final_stage_branch_features']['cls'])
 
         cls_loss /= (len(targets) * self.refine_layers)
         reg_xytl_loss /= (len(targets) * self.refine_layers)
         iou_loss /= (len(targets) * self.refine_layers)
+        smooth_loss /= (len(targets) * self.refine_layers)
+        order_loss /= (len(targets) * self.refine_layers)
+        tcl_loss /= (len(targets) * self.refine_layers)
 
         loss = cls_loss * cls_loss_weight + reg_xytl_loss * xyt_loss_weight \
-            + seg_loss * seg_loss_weight + iou_loss * iou_loss_weight
+            + seg_loss * seg_loss_weight + iou_loss * iou_loss_weight \
+            + tcl_loss * tcl_loss_weight + orth_loss * orth_loss_weight
 
         return_value = {
             'loss': loss,
@@ -452,7 +515,11 @@ class CLRHead(nn.Module):
                 'cls_loss': cls_loss * cls_loss_weight,
                 'reg_xytl_loss': reg_xytl_loss * xyt_loss_weight,
                 'seg_loss': seg_loss * seg_loss_weight,
-                'iou_loss': iou_loss * iou_loss_weight
+                'iou_loss': iou_loss * iou_loss_weight,
+                'smooth_loss': smooth_loss,
+                'order_loss': order_loss_weight * order_loss,
+                'tcl_loss': tcl_loss_weight * tcl_loss,
+                'orth_loss': orth_loss_weight * orth_loss
             }
         }
 
@@ -463,18 +530,13 @@ class CLRHead(nn.Module):
 
 
     def get_lanes(self, output, as_lanes=True):
-        '''
-        Convert model output to lanes.
-        '''
         softmax = nn.Softmax(dim=1)
 
         decoded = []
         for predictions in output:
             try:
-                # 先限制预测数量，避免显存溢出（在softmax之前）
-                max_predictions = 500  # 降低到500，更保守
+                max_predictions = 500  
                 if predictions.shape[0] > max_predictions:
-                    # 使用简单的分类得分来选择top-k，避免计算所有softmax
                     cls_scores = predictions[:, 1] - predictions[:, 0]  # 简单的得分估计
                     top_scores, top_indices = torch.topk(cls_scores, max_predictions)
                     predictions = predictions[top_indices]
@@ -492,7 +554,6 @@ class CLRHead(nn.Module):
                     decoded.append([])
                     continue
                 
-                # 再次限制，确保不超过限制
                 if predictions.shape[0] > max_predictions:
                     top_scores, top_indices = torch.topk(scores, max_predictions)
                     predictions = predictions[top_indices]
@@ -514,11 +575,11 @@ class CLRHead(nn.Module):
                 
                 del nms_predictions
                 torch.cuda.empty_cache()
-            
                 if num_to_keep > 0:
                     keep = keep[:num_to_keep]
                     max_idx = predictions.shape[0] - 1
                     if isinstance(keep, torch.Tensor):
+
                         valid_mask = (keep >= 0) & (keep <= max_idx)
                         if valid_mask.any():
                             keep = keep[valid_mask]
@@ -555,7 +616,6 @@ class CLRHead(nn.Module):
                 
             except RuntimeError as e:
                 if "out of memory" in str(e):
-
                     torch.cuda.empty_cache()
                     decoded.append([])
                     continue
